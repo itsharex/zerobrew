@@ -41,15 +41,20 @@ enum Commands {
         /// Use abridged list (fast packages with few deps)
         #[arg(long)]
         quick: bool,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
 #[derive(Serialize)]
 struct BenchResult {
     name: String,
-    cold_install_ms: u64,
-    warm_reinstall_ms: u64,
-    speedup: f64,
+    homebrew_cold_ms: u64,
+    zerobrew_cold_ms: u64,
+    zerobrew_warm_ms: u64,
+    cold_speedup: f64,
 }
 
 #[derive(Serialize)]
@@ -333,9 +338,10 @@ async fn run_real_bench(formula: &str) -> Result<BenchResult, Box<dyn std::error
 
     Ok(BenchResult {
         name: formula.to_string(),
-        cold_install_ms: zb_cold_ms,
-        warm_reinstall_ms: zb_warm_ms,
-        speedup: cold_speedup,
+        homebrew_cold_ms: brew_cold_ms,
+        zerobrew_cold_ms: zb_cold_ms,
+        zerobrew_warm_ms: zb_warm_ms,
+        cold_speedup,
     })
 }
 
@@ -372,11 +378,13 @@ const POPULAR_PACKAGES: &[&str] = &[
     "libidn2", "berkeley-db@5", "deno", "libedit", "oniguruma",
 ];
 
-async fn run_suite_bench(count: usize, quick: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_suite_bench(count: usize, quick: bool, json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
     let source = if quick { "abridged" } else { "top 100" };
-    println!("Running benchmark suite ({} packages from {} list)...\n", count, source);
+    if !json_output {
+        println!("Running benchmark suite ({} packages from {} list)...\n", count, source);
+    }
 
     let package_list = if quick { POPULAR_PACKAGES_ABRIDGED } else { POPULAR_PACKAGES };
     let packages: Vec<&str> = package_list.iter().take(count).copied().collect();
@@ -384,7 +392,9 @@ async fn run_suite_bench(count: usize, quick: bool) -> Result<(), Box<dyn std::e
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for (i, formula) in packages.iter().enumerate() {
-        println!("[{}/{}] Benchmarking: {}", i + 1, count, formula);
+        if !json_output {
+            println!("[{}/{}] Benchmarking: {}", i + 1, count, formula);
+        }
 
         // Clean up
         let _ = Command::new("brew")
@@ -398,43 +408,21 @@ async fn run_suite_bench(count: usize, quick: bool) -> Result<(), Box<dyn std::e
         match run_real_bench(formula).await {
             Ok(result) => results.push(result),
             Err(e) => {
-                println!("  FAILED: {}", e);
+                if !json_output {
+                    println!("  FAILED: {}", e);
+                }
                 failures.push((formula.to_string(), e.to_string()));
             }
         }
-        println!();
-    }
-
-    // Summary
-    println!("\n=== Suite Summary ===");
-    println!("Tested: {} packages", count);
-    println!("Passed: {}", results.len());
-    println!("Failed: {}", failures.len());
-
-    if !results.is_empty() {
-        let avg_speedup: f64 = results.iter().map(|r| r.speedup).sum::<f64>() / results.len() as f64;
-        let avg_warm_speedup: f64 = results.iter().map(|r| {
-            if r.warm_reinstall_ms > 0 {
-                r.cold_install_ms as f64 / r.warm_reinstall_ms as f64
-            } else {
-                1.0
-            }
-        }).sum::<f64>() / results.len() as f64;
-
-        println!("\nPerformance:");
-        println!("  Avg cold speedup vs Homebrew: {:.1}x", avg_speedup);
-        println!("  Avg warm speedup vs cold:     {:.1}x", avg_warm_speedup);
-    }
-
-    if !failures.is_empty() {
-        println!("\nFailed packages:");
-        for (name, err) in &failures {
-            println!("  {} - {}", name, err);
+        if !json_output {
+            println!();
         }
     }
 
     // Clean up all installed packages
-    println!("\nCleaning up...");
+    if !json_output {
+        println!("\nCleaning up...");
+    }
     for formula in &packages {
         let _ = Command::new("brew")
             .args(["uninstall", "--ignore-dependencies", formula])
@@ -443,7 +431,79 @@ async fn run_suite_bench(count: usize, quick: bool) -> Result<(), Box<dyn std::e
     }
     // Also uninstall all zb packages (in case of dependencies)
     let _ = Command::new("zb").args(["uninstall"]).output();
-    println!("Done.");
+
+    // Output
+    if json_output {
+        #[derive(Serialize)]
+        struct SuiteOutput {
+            results: Vec<BenchResult>,
+            failures: Vec<(String, String)>,
+            summary: SuiteSummary,
+        }
+        #[derive(Serialize)]
+        struct SuiteSummary {
+            tested: usize,
+            passed: usize,
+            failed: usize,
+            avg_cold_speedup: f64,
+            avg_warm_speedup: f64,
+        }
+
+        let avg_speedup = if results.is_empty() { 0.0 } else {
+            results.iter().map(|r| r.cold_speedup).sum::<f64>() / results.len() as f64
+        };
+        let avg_warm_speedup = if results.is_empty() { 0.0 } else {
+            results.iter().map(|r| {
+                if r.zerobrew_warm_ms > 0 {
+                    r.zerobrew_cold_ms as f64 / r.zerobrew_warm_ms as f64
+                } else {
+                    1.0
+                }
+            }).sum::<f64>() / results.len() as f64
+        };
+
+        let output = SuiteOutput {
+            results,
+            failures: failures.clone(),
+            summary: SuiteSummary {
+                tested: count,
+                passed: count - failures.len(),
+                failed: failures.len(),
+                avg_cold_speedup: avg_speedup,
+                avg_warm_speedup: avg_warm_speedup,
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    } else {
+        // Summary
+        println!("\n=== Suite Summary ===");
+        println!("Tested: {} packages", count);
+        println!("Passed: {}", results.len());
+        println!("Failed: {}", failures.len());
+
+        if !results.is_empty() {
+            let avg_speedup: f64 = results.iter().map(|r| r.cold_speedup).sum::<f64>() / results.len() as f64;
+            let avg_warm_speedup: f64 = results.iter().map(|r| {
+                if r.zerobrew_warm_ms > 0 {
+                    r.zerobrew_cold_ms as f64 / r.zerobrew_warm_ms as f64
+                } else {
+                    1.0
+                }
+            }).sum::<f64>() / results.len() as f64;
+
+            println!("\nPerformance:");
+            println!("  Avg cold speedup vs Homebrew: {:.1}x", avg_speedup);
+            println!("  Avg warm speedup vs cold:     {:.1}x", avg_warm_speedup);
+        }
+
+        if !failures.is_empty() {
+            println!("\nFailed packages:");
+            for (name, err) in &failures {
+                println!("  {} - {}", name, err);
+            }
+        }
+        println!("Done.");
+    }
 
     Ok(())
 }
@@ -498,8 +558,8 @@ async fn main() {
                 }
             }
         }
-        Commands::Suite { count, quick } => {
-            if let Err(e) = run_suite_bench(count, quick).await {
+        Commands::Suite { count, quick, json } => {
+            if let Err(e) = run_suite_bench(count, quick, json).await {
                 eprintln!("Suite benchmark failed: {}", e);
                 std::process::exit(1);
             }
